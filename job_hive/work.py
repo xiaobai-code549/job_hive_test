@@ -1,6 +1,5 @@
 import time
 import traceback
-import os
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 from functools import wraps
@@ -30,25 +29,26 @@ class HiveWork:
     def pop(self) -> Optional['Job']:
         return self._queue.dequeue()
 
-    def work(self, prefetching: int = 0, waiting: int = 3, concurrent: int = 0, result_ttl: int = 24 * 60 * 60):
-        # 如果concurrent为0，则根据CPU核心数动态分配
-        if concurrent <= 0:
+    def work(self, prefetching: int = 1, waiting: int = 3, concurrent: int = None, result_ttl: int = 24 * 60 * 60):
+        # 如果未指定并发数，根据CPU核心数动态分配
+        auto_allocated = False
+        if concurrent is None:
             concurrent = multiprocessing.cpu_count()
-        
-        # 如果prefetching为0，则设置为concurrent的2倍
-        if prefetching <= 0:
-            prefetching = concurrent * 2
+            auto_allocated = True
         
         self.logger = LiveLogger()
+        
+        if auto_allocated:
+            self.logger.info(f"未指定并发数，根据CPU核心数自动分配: {concurrent}")
+        
         self.logger.info(r"""
    $$$$$\  $$$$$$\  $$$$$$$\          $$\   $$\ $$$$$$\ $$\    $$\ $$$$$$$$\ 
-   \__$$ |$$  __$$\ $$  __$$\         $$ |  $$ |\_$$  _|$$ |   $$ |$$  _____| 
-      $$ |$$ /  $$ |$$ |  $$ |        $$ |  $$ |  $$ |  $$ |   $$ |$$ |       
-      $$ |$$ |  $$ |$$$$$$$\ |$$$$$$\ $$$$$$$$ |  $$ |  \$$\  $$  |$$$$$\     
-$$\   $$ |$$ |  $$ |$$  __$$\ \______|$$  __$$ |  $$ |   \$$\$$  / $$  __|    
+   \__$$ |$$  __$$\ $$  __$$\         $$ |  $$ |\_$$  _|$$ |   $$ |$$  _____|\n      $$ |$$ /  $$ |$$ |  $$ |        $$ |  $$ |  $$ |  $$ |   $$ |$$ |      
+      $$ |$$ |  $$ |$$$$$$$\ |$$$$$$\ $$$$$$$$ |  $$ |  \$$\  $$  |$$$$$\    
+$$\   $$ |$$ |  $$ |$$  __$$\ \______|$$  __$$ |  $$ |   \$$\$$  / $$  __|   
 $$ |  $$ |$$ |  $$ |$$ |  $$ |        $$ |  $$ |  $$ |    \$$$  /  $$ |      
 \$$$$$$  | $$$$$$  |$$$$$$$  |        $$ |  $$ |$$$$$$\    \$  /   $$$$$$$$\ 
- \______/  \______/ \_______/         \__|  \__|\______|    \_/    \________| 
+ \______/  \______/ \_______/         \__|  __|\______|    \_/    \________|
 
 prefetching: {}
 waiting: {}
@@ -57,85 +57,44 @@ result ttl: {}
 Started work...
 """.format(prefetching, waiting, concurrent, result_ttl))
         
-        # 记录任务执行时间统计
-        job_stats = {
-            'total': 0,
-            'success': 0,
-            'failure': 0,
-            'total_time': 0
-        }
-        
-        self._process_pool = ProcessPoolExecutor(max_workers=concurrent)
-        run_jobs = {}
-        
         try:
+            self._process_pool = ProcessPoolExecutor(max_workers=concurrent)
+            run_jobs = {}
             while True:
                 if len(run_jobs) >= prefetching:
                     flush_jobs = {}
-                    for job_id, (future, job, start_time) in run_jobs.items():
+                    for job_id, (future, job) in run_jobs.items():
                         if not future.done():
-                            flush_jobs[job_id] = (future, job, start_time)
+                            flush_jobs[job_id] = (future, job)
                             continue
-                        
-                        # 计算任务执行时间
-                        execution_time = time.time() - start_time
-                        job_stats['total'] += 1
-                        job_stats['total_time'] += execution_time
-                        
                         job.query["ended_at"] = get_now()
-                        job.query["execution_time"] = execution_time
-                        
                         try:
                             job.query["result"] = str(future.result())
                             job.query["status"] = Status.SUCCESS.value
-                            job_stats['success'] += 1
-                            self.logger.info(f"Successes job: {job.job_id} (took {execution_time:.2f}s)")
+                            self.logger.info(f"Successes job: {job.job_id}")
                             self._queue.ttl(job.job_id, result_ttl)
                         except Exception as e:
                             job.query["error"] = "{}\n{}".format(e, traceback.format_exc())
                             job.query["status"] = Status.FAILURE.value
-                            job_stats['failure'] += 1
-                            self.logger.error(f"Failures job: {job.job_id} (took {execution_time:.2f}s)")
+                            self.logger.error(f"Failures job: {job.job_id}")
                         finally:
                             self._queue.update_status(job)
                     run_jobs = flush_jobs
-                    
-                    # 每处理10个任务打印一次统计信息
-                    if job_stats['total'] > 0 and job_stats['total'] % 10 == 0:
-                        avg_time = job_stats['total_time'] / job_stats['total'] if job_stats['total'] > 0 else 0
-                        success_rate = (job_stats['success'] / job_stats['total']) * 100 if job_stats['total'] > 0 else 0
-                        self.logger.info(f"Job stats: Total={job_stats['total']}, Success={job_stats['success']}, "
-                                     f"Failure={job_stats['failure']}, Avg time={avg_time:.2f}s, "
-                                     f"Success rate={success_rate:.1f}%")
                 else:
                     job = self.pop()
                     if job is None:
                         time.sleep(waiting)
                         continue
                     self.logger.info(f"Started job: {job.job_id}")
-                    start_time = time.time()
                     future = self._process_pool.submit(job)
-                    run_jobs[job.job_id] = (future, job, start_time)
+                    run_jobs[job.job_id] = (future, job)
                     self._queue.update_status(job)
+        except KeyboardInterrupt:
+            self.logger.info("工作进程被用户中断")
+        except Exception as e:
+            self.logger.error(f"工作过程中发生错误: {e}\n{traceback.format_exc()}")
         finally:
-            # 关闭进程池
-            if self._process_pool:
-                self._process_pool.shutdown()
-                self.logger.info("Process pool shutdown completed")
-                
-                # 打印最终统计信息
-                if job_stats['total'] > 0:
-                    avg_time = job_stats['total_time'] / job_stats['total']
-                    success_rate = (job_stats['success'] / job_stats['total']) * 100
-                    self.logger.info(f"Final job stats: Total={job_stats['total']}, Success={job_stats['success']}, "
-                                 f"Failure={job_stats['failure']}, Avg time={avg_time:.2f}s, "
-                                 f"Success rate={success_rate:.1f}%")
-            
-            # 关闭队列连接
-            if hasattr(self._queue, 'close'):
-                self._queue.close()
-                if self.logger:
-                    self.logger.info("Queue connection closed")
+            self._cleanup()
 
     def get_job(self, job_id: str) -> Optional['Job']:
         return self._queue.get_job(job_id)
@@ -181,23 +140,30 @@ Started work...
         return self._queue.size
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        # 关闭进程池
-        if self._process_pool is not None:
-            self._process_pool.shutdown()
-        # 关闭队列连接
-        if hasattr(self._queue, 'close'):
-            self._queue.close()
+        self._cleanup()
 
     def __enter__(self):
         return self
 
     def __del__(self):
+        self._cleanup()
+
+    def _cleanup(self):
+        """清理资源"""
         # 关闭进程池
         if self._process_pool is not None:
-            self._process_pool.shutdown()
-        # 关闭队列连接
-        if hasattr(self._queue, 'close'):
+            try:
+                self._process_pool.shutdown()
+                self._process_pool = None
+            except Exception as e:
+                if self.logger:
+                    self.logger.error(f"关闭进程池时发生错误: {e}")
+        # 关闭队列连接池
+        try:
             self._queue.close()
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"关闭队列连接池时发生错误: {e}")
 
     def __repr__(self):
         return f"<HiveWork queue={self._queue}>"

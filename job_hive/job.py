@@ -1,9 +1,9 @@
 import inspect
 import json
 import uuid
-from typing import Optional, Any
-
-import cloudpickle
+import base64
+import copy
+from typing import Optional, Any, Dict, List, Tuple, Union
 
 from job_hive.core import Status
 from job_hive.utils import import_attribute, get_now
@@ -81,14 +81,29 @@ class Job:
         return job
 
     @staticmethod
-    def _dumps(obj: Any) -> bytes:
-        return cloudpickle.dumps(obj)
+    def _dumps(obj: Any) -> Union[str, bytes]:
+        """安全的序列化方法"""
+        if obj is None:
+            return "None"
+        elif isinstance(obj, (str, int, float, bool)):
+            return obj
+        elif isinstance(obj, (list, tuple)):
+            return [Job._dumps(item) for item in obj]
+        elif isinstance(obj, dict):
+            return {k: Job._dumps(v) for k, v in obj.items()}
+        else:
+            # 对于复杂对象，使用JSON序列化
+            try:
+                return json.dumps(obj)
+            except:
+                # 如果JSON序列化失败，返回字符串表示
+                return str(obj)
 
     @property
     def detail(self):
         return json.dumps({
             "job_id": self.job_id,
-            "func": self.func.__name__,
+            "func": self.func,
             "args": str(self._args),
             "kwargs": str(self._kwargs),
             "created_at": self.created_at,

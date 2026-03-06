@@ -1,5 +1,4 @@
-import cloudpickle
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from job_hive.queue.base import BaseQueue
 from job_hive.core import Status
@@ -37,43 +36,45 @@ class RedisQueue(BaseQueue):
         return redis.Redis(connection_pool=self._pool)
 
     def enqueue(self, *args: 'Job'):
-        if not args:
-            return
-        
-        # 使用管道减少Redis交互次数
         pipe = self.conn.pipeline()
-        
         for job in args:
             job.query['created_at'] = job.created_at
             pipe.hset(
                 name=f"hive:job:{job.job_id}",
                 mapping=job.dumps()
             )
-        
-        pipe.rpush(
-            self._queue_name,
-            *(job.job_id for job in args)
-        )
-        
-        # 执行管道命令
+        if args:
+            pipe.rpush(
+                self._queue_name,
+                *(job.job_id for job in args)
+            )
         pipe.execute()
 
     def remove(self, job: 'Job'):
-        self.conn.hdel(
+        pipe = self.conn.pipeline()
+        pipe.hdel(
             name=f"hive:job:{job.job_id}"
         )
-        self.conn.lrem(
+        pipe.lrem(
             self._queue_name,
             0,
             job.job_id
         )
+        pipe.execute()
         job.query.clear()
 
     def clear(self):
-        for job_id in self.conn.lpop(self._queue_name, 0):
-            self.conn.hdel(
-                name=f"hive:job:{job_id}"
-            )
+        # 改进clear方法，使用pipeline批量操作
+        pipe = self.conn.pipeline()
+        while True:
+            job_ids = self.conn.lrange(self._queue_name, 0, 99)
+            if not job_ids:
+                break
+            for job_id in job_ids:
+                job_id_str = as_string(job_id)
+                pipe.hdel(f"hive:job:{job_id_str}")
+            pipe.ltrim(self._queue_name, len(job_ids), -1)
+            pipe.execute()
 
     def dequeue(self) -> Optional['Job']:
         job_id = self.conn.lpop(self._queue_name)
@@ -107,12 +108,13 @@ class RedisQueue(BaseQueue):
         return Job._loads(self._transform_job_mapping(job_mapping))
 
     @staticmethod
-    def _transform_job_mapping(job_mapping: dict):
+    def _transform_job_mapping(job_mapping: dict) -> Dict[str, Any]:
         job_decode_mapping = {}
         for key, value in job_mapping.items():
             key = as_string(key)
-            job_decode_mapping[key] = cloudpickle.loads(value) if key in {'args', 'kwargs', 'result',
-                                                                     'error'} else as_string(value)
+            value_str = as_string(value)
+            # 直接使用字符串值，因为Job._dumps已经处理了序列化
+            job_decode_mapping[key] = value_str
         return job_decode_mapping
 
     @property
@@ -123,7 +125,7 @@ class RedisQueue(BaseQueue):
         self.conn.expire(name=f"hive:job:{job_id}", time=ttl)
 
     def is_empty(self) -> bool:
-        return bool(self.conn.llen(self._queue_name))
+        return self.conn.llen(self._queue_name) == 0
 
     def __repr__(self):
         return f"RedisQueue(name={self._queue_name})"
