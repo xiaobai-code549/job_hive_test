@@ -1,9 +1,8 @@
 import inspect
 import json
+import pickle
 import uuid
 from typing import Optional, Any
-
-import cloudpickle
 
 from job_hive.core import Status
 from job_hive.utils import import_attribute, get_now
@@ -82,7 +81,7 @@ class Job:
 
     @staticmethod
     def _dumps(obj: Any) -> bytes:
-        return cloudpickle.dumps(obj)
+        return pickle.dumps(obj)
 
     @property
     def detail(self):

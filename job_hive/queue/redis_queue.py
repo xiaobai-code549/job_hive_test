@@ -1,4 +1,4 @@
-import cloudpickle
+import pickle
 from typing import Optional
 
 from job_hive.queue.base import BaseQueue
@@ -37,26 +37,16 @@ class RedisQueue(BaseQueue):
         return redis.Redis(connection_pool=self._pool)
 
     def enqueue(self, *args: 'Job'):
-        if not args:
-            return
-        
-        # 使用管道减少Redis交互次数
-        pipe = self.conn.pipeline()
-        
         for job in args:
             job.query['created_at'] = job.created_at
-            pipe.hset(
+            self.conn.hset(
                 name=f"hive:job:{job.job_id}",
                 mapping=job.dumps()
             )
-        
-        pipe.rpush(
+        self.conn.rpush(
             self._queue_name,
             *(job.job_id for job in args)
         )
-        
-        # 执行管道命令
-        pipe.execute()
 
     def remove(self, job: 'Job'):
         self.conn.hdel(
@@ -111,7 +101,7 @@ class RedisQueue(BaseQueue):
         job_decode_mapping = {}
         for key, value in job_mapping.items():
             key = as_string(key)
-            job_decode_mapping[key] = cloudpickle.loads(value) if key in {'args', 'kwargs', 'result',
+            job_decode_mapping[key] = pickle.loads(value) if key in {'args', 'kwargs', 'result',
                                                                      'error'} else as_string(value)
         return job_decode_mapping
 
